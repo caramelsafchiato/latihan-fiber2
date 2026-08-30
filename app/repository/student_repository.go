@@ -1,0 +1,189 @@
+package repository
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"latihan-fiber2/app/model" 
+)
+
+// Sentinel error
+var (
+	ErrNotFound  = errors.New("data tidak ditemukan")
+	ErrDuplicate = errors.New("data sudah ada")
+)
+
+// StudentRepository adalah KONTRAK penyimpanan data mahasiswa.
+type StudentRepository interface {
+	FindAll(ctx context.Context, q model.ListQuery) ([]model.Student, int, error)
+	FindByID(ctx context.Context, id int) (model.Student, error)
+	Create(ctx context.Context, s model.Student) (model.Student, error)
+	Update(ctx context.Context, s model.Student) (model.Student, error)
+	Delete(ctx context.Context, id int) error
+}
+
+// kolomUrut mencegah SQL injection pada ORDER BY.
+// Sesuaikan nama kolom ini jika kamu menggunakan nim/nama di database.
+var kolomUrut = map[string]string{
+	"id":         "id",
+	"username":   "username", 
+	"email":      "email",
+	"created_at": "created_at",
+}
+
+type studentPostgresRepository struct {
+	pool *pgxpool.Pool
+}
+
+// NewStudentRepository mengembalikan interface StudentRepository
+func NewStudentRepository(pool *pgxpool.Pool) StudentRepository {
+	return &studentPostgresRepository{pool: pool}
+}
+
+func buildFilter(q model.ListQuery) (string, []any) {
+	where := " WHERE 1 = 1"
+	args := []any{}
+
+	if q.Search != "" {
+		// Sesuaikan 'username' atau 'email' dengan kolom tabel mahasiswa kamu (misal: 'nama' atau 'nim')
+		where += fmt.Sprintf(" AND (username ILIKE $%d OR email ILIKE $%d)", len(args)+1, len(args)+1)
+		args = append(args, "%"+q.Search+"%", "%"+q.Search+"%")
+	}
+
+	if q.IsActive != nil {
+		where += fmt.Sprintf(" AND is_active = $%d", len(args)+1)
+		args = append(args, *q.IsActive)
+	}
+
+	return where, args
+}
+
+func (r *studentPostgresRepository) FindAll(
+	ctx context.Context, q model.ListQuery,
+) ([]model.Student, int, error) {
+	where, args := buildFilter(q)
+
+	var total int
+	err := r.pool.QueryRow(ctx, "SELECT COUNT(*) FROM students"+where, args...).Scan(&total)
+	if err != nil {
+		return nil, 0, fmt.Errorf("menghitung data mahasiswa: %w", err)
+	}
+
+	arah := "ASC"
+	if q.Order == "desc" {
+		arah = "DESC"
+	}
+
+	sqlText := fmt.Sprintf(
+		`SELECT id, username, email, password, is_active, created_at
+		FROM students%s
+		ORDER BY %s %s
+		LIMIT $%d OFFSET $%d`,
+		where, kolomUrut[q.Sort], arah, len(args)+1, len(args)+2,
+	)
+	args = append(args, q.Limit, q.Offset())
+
+	rows, err := r.pool.Query(ctx, sqlText, args...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("mengambil daftar mahasiswa: %w", err)
+	}
+	defer rows.Close()
+
+	hasil := []model.Student{}
+	for rows.Next() {
+		var s model.Student
+		if err := rows.Scan(&s.ID, &s.Username, &s.Email, &s.Password, &s.IsActive, &s.CreatedAt); err != nil {
+			return nil, 0, fmt.Errorf("membaca baris mahasiswa: %w", err)
+		}
+		hasil = append(hasil, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("membaca hasil query: %w", err)
+	}
+
+	return hasil, total, nil
+}
+
+func (r *studentPostgresRepository) FindByID(
+	ctx context.Context, id int,
+) (model.Student, error) {
+	var s model.Student
+	err := r.pool.QueryRow(ctx,
+		`SELECT id, username, email, password, is_active, created_at
+		FROM students WHERE id = $1`, id,
+	).Scan(&s.ID, &s.Username, &s.Email, &s.Password, &s.IsActive, &s.CreatedAt)
+
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return model.Student{}, ErrNotFound
+		}
+		return model.Student{}, fmt.Errorf("mengambil data mahasiswa: %w", err)
+	}
+	return s, nil
+}
+
+func (r *studentPostgresRepository) Create(
+	ctx context.Context, s model.Student,
+) (model.Student, error) {
+	err := r.pool.QueryRow(ctx,
+		`INSERT INTO students (username, email, password, is_active)
+		VALUES ($1, $2, $3, $4)
+		RETURNING id, created_at`,
+		s.Username, s.Email, s.Password, s.IsActive,
+	).Scan(&s.ID, &s.CreatedAt)
+
+	if err != nil {
+		if isUniqueViolation(err) {
+			return model.Student{}, ErrDuplicate
+		}
+		return model.Student{}, fmt.Errorf("menyimpan data mahasiswa: %w", err)
+	}
+	return s, nil
+}
+
+func (r *studentPostgresRepository) Update(
+	ctx context.Context, s model.Student,
+) (model.Student, error) {
+	err := r.pool.QueryRow(ctx,
+		`UPDATE students SET username = $1, email = $2, is_active = $3
+		WHERE id = $4
+		RETURNING id, username, email, password, is_active, created_at`,
+		s.Username, s.Email, s.IsActive, s.ID,
+	).Scan(&s.ID, &s.Username, &s.Email, &s.Password, &s.IsActive, &s.CreatedAt)
+
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return model.Student{}, ErrNotFound
+		}
+		if isUniqueViolation(err) {
+			return model.Student{}, ErrDuplicate
+		}
+		return model.Student{}, fmt.Errorf("memperbarui data mahasiswa: %w", err)
+	}
+	return s, nil
+}
+
+func (r *studentPostgresRepository) Delete(ctx context.Context, id int) error {
+	tag, err := r.pool.Exec(ctx, `DELETE FROM students WHERE id = $1`, id)
+	if err != nil {
+		return fmt.Errorf("menghapus data mahasiswa: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// isUniqueViolation memeriksa kode error PostgreSQL 23505
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == "23505"
+	}
+	return false
+}
