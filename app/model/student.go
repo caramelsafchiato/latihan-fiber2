@@ -3,7 +3,7 @@ package model
 import "time"
 
 // User (atau Student) merepresentasikan entitas data mahasiswa di basis data
-type User struct {
+type Student struct {
 	ID        int       `json:"id"`
 	Username  string    `json:"username"`
 	Email     string    `json:"email"`
